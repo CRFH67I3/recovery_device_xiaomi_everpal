@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${CI_YML_URL:?需要 CI_YML_URL（存放 main.yml 的 raw 地址）}"
+: "${CI_YML_SHA256:?需要 CI_YML_SHA256（main.yml 的 sha256）}"
+: "${GH_TOKEN:?需要 GH_TOKEN（repo 权限）}"
+
+REPO="${GITHUB_REPOSITORY:?in actions only}"
+TARGET="${CI_TARGET_PATH:-.github/workflows/main.yml}"
+
+curl -fsSL --retry 3 "$CI_YML_URL" -o /tmp/main.yml
+echo "$CI_YML_SHA256  /tmp/main.yml" | sha256sum -c -
+
+B64=$(base64 -w0 /tmp/main.yml)
+
+# 取当前 sha（文件存在时）
+SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+  "https://api.github.com/repos/$REPO/contents/$TARGET" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('sha',''))" || true)
+
+python3 - "$TARGET" "$B64" "$SHA" <<'PY' > /tmp/payload.json
+import json, sys
+path, b64, sha = sys.argv[1:4]
+body = {"message": "ci: install workflow (strict mode kept optional)", "content": b64, "branch": "master"}
+if sha:
+    body["sha"] = sha
+print(json.dumps({"path": path, "payload": body}))
+PY
+
+curl -fsSL -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+  -d @<(python3 -c "import json;d=json.load(open('/tmp/payload.json'));print(json.dumps(d['payload']))") \
+  "https://api.github.com/repos/$REPO/contents/$TARGET" | tee /tmp/put.json | head -c 400
+echo
