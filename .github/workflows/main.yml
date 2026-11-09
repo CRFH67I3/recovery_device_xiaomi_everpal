@@ -1,0 +1,133 @@
+name: Build everpal recovery (OrangeFox / PBRP)
+
+# 手动触发：Actions → Build everpal recovery → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      flavour:
+        description: 'ofox | pbrp | both'
+        required: true
+        default: 'ofox'
+        type: choice
+        options: [ofox, pbrp, both]
+      mode:
+        description: 'ramboot = 只用于 fastboot boot 测试；flash = 可刷入；both = 两个都出'
+        required: true
+        default: 'both'
+        type: choice
+        options: [both, ramboot, flash]
+
+concurrency:
+  group: everpal-${{ github.ref }}-${{ inputs.flavour }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        flavour: ${{ fromJSON(inputs.flavour == 'both' && '["ofox","pbrp"]' || format('["{0}"]', inputs.flavour)) }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" /usr/local/.ghcup || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg \
+            gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev libelf-dev \
+            liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python3-pip \
+            openjdk-11-jdk-headless unzip
+          python3 --version
+
+      - name: Set up repo
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Check for ref/ and tools/aosp/
+        run: |
+          set -e
+          mkdir -p "$HOME/evergo-recovery/tools/aosp"
+          cd "$HOME/evergo-recovery/tools/aosp"
+          curl -fsSL https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/unpack_bootimg.py?format=TEXT | base64 -d > unpack_bootimg.py
+          curl -fsSL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d > avbtool.py
+          ls -l
+
+      - name: Checkout device tree
+        uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 1
+
+      - name: Prepare ~/evergo-recovery layout
+        run: |
+          set -e
+          W="$HOME/evergo-recovery"
+          mkdir -p "$W"
+          rm -rf "$W/device_xiaomi_everpal"
+          cp -a src "$W/device_xiaomi_everpal"
+          rm -rf "$W/device_xiaomi_everpal/.git"
+          if [ -f "$W/device_xiaomi_everpal/ref/phone_precheck.txt" ]; then
+            cp -a "$W/device_xiaomi_everpal/ref" "$W/ref"
+            echo "ref present"
+          fi
+          ls -l "$W"
+
+      - name: Sync sources
+        run: |
+          set -e
+          if [ "${{ matrix.flavour }}" = ofox ]; then
+            S="$HOME/fox_12.1"
+            if [ ! -d "$S/.repo" ]; then
+              mkdir -p "$HOME/fox_sync" && cd "$HOME/fox_sync"
+              git clone --depth=1 https://gitlab.com/OrangeFox/sync.git
+              cd sync && ./orangefox_sync.sh --branch 12.1 --path "$S"
+            fi
+            if [ ! -d "$S/external/nano" ]; then
+              git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_external_nano "$S/external/nano"
+            fi
+            test -f "$S/build/envsetup.sh"
+          else
+            S="$HOME/pbrp_12.1"
+            mkdir -p "$S" && cd "$S"
+            repo init --depth=1 -u https://github.com/PitchBlackRecoveryProject/manifest_pb -b android-12.1
+            repo sync -c --force-sync --no-tags --no-clone-bundle -j$(nproc)
+            test -f "$S/build/envsetup.sh"
+          fi
+
+      - name: Build
+        env:
+          FLAVOUR: ${{ matrix.flavour }}
+        run: |
+          set -euo pipefail
+          W="$HOME/evergo-recovery"
+          cd "$W/device_xiaomi_everpal/tools"
+          bash ./build_recovery.sh "$FLAVOUR"
+          ls -l "$W/images"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: everpal-${{ matrix.flavour }}-${{ github.run_number }}
+          path: /home/runner/evergo-recovery/images/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.flavour }}-${{ github.run_number }}
+          path: /home/runner/evergo-recovery/build_*.log
+          if-no-files-found: ignore
+          retention-days: 7
