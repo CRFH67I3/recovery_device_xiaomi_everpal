@@ -10,12 +10,6 @@ on:
         default: 'ofox'
         type: choice
         options: [ofox, pbrp, both]
-      mode:
-        description: 'ramboot = 只用于 fastboot boot 测试；flash = 可刷入；both = 两个都出'
-        required: true
-        default: 'both'
-        type: choice
-        options: [both, ramboot, flash]
 
 concurrency:
   group: everpal-${{ github.ref }}-${{ inputs.flavour }}
@@ -54,34 +48,36 @@ jobs:
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Check for ref/ and tools/aosp/
-        run: |
-          set -e
-          mkdir -p "$HOME/evergo-recovery/tools/aosp"
-          cd "$HOME/evergo-recovery/tools/aosp"
-          curl -fsSL https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/unpack_bootimg.py?format=TEXT | base64 -d > unpack_bootimg.py
-          curl -fsSL https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT | base64 -d > avbtool.py
-          ls -l
-
       - name: Checkout device tree
         uses: actions/checkout@v4
         with:
           path: src
           fetch-depth: 1
 
-      - name: Prepare ~/evergo-recovery layout
+      # 项目脚本期望：~/evergo-recovery/{device_xiaomi_everpal, tools, ref}
+      - name: Prepare evergo-recovery layout
         run: |
           set -e
           W="$HOME/evergo-recovery"
+          rm -rf "$W"
           mkdir -p "$W"
-          rm -rf "$W/device_xiaomi_everpal"
           cp -a src "$W/device_xiaomi_everpal"
           rm -rf "$W/device_xiaomi_everpal/.git"
+          # 外层 tools/：脚本调用 $W/tools/check_*.py，工具脚本在设备树 tools 里
+          cp -a "$W/device_xiaomi_everpal/tools" "$W/tools"
+          mkdir -p "$W/tools/aosp"
+          cd "$W/tools/aosp"
+          curl -fsSL "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/unpack_bootimg.py?format=TEXT" | base64 -d > unpack_bootimg.py
+          curl -fsSL "https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT" | base64 -d > avbtool.py
+          # ref/：gate 1 与镜像比对需要，仓库中不存在时跳过依赖它的检查
           if [ -f "$W/device_xiaomi_everpal/ref/phone_precheck.txt" ]; then
             cp -a "$W/device_xiaomi_everpal/ref" "$W/ref"
-            echo "ref present"
+            echo "HAVE_REF=1" >> "$GITHUB_ENV"
+          else
+            echo "HAVE_REF=0" >> "$GITHUB_ENV"
+            echo "::warning::ref missing, check_tree and ref-based image checks will be skipped"
           fi
-          ls -l "$W"
+          ls -l "$W" "$W/tools" | head -30
 
       - name: Sync sources
         run: |
@@ -101,18 +97,17 @@ jobs:
             S="$HOME/pbrp_12.1"
             mkdir -p "$S" && cd "$S"
             repo init --depth=1 -u https://github.com/PitchBlackRecoveryProject/manifest_pb -b android-12.1
-            repo sync -c --force-sync --no-tags --no-clone-bundle -j$(nproc)
+            repo sync -c --force-sync --no-tags --no-clone-bundle -j"$(nproc)"
             test -f "$S/build/envsetup.sh"
           fi
+          df -h / | tail -1
 
-      - name: Build
-        env:
-          FLAVOUR: ${{ matrix.flavour }}
+      - name: Build (project pipeline)
         run: |
           set -euo pipefail
           W="$HOME/evergo-recovery"
           cd "$W/device_xiaomi_everpal/tools"
-          bash ./build_recovery.sh "$FLAVOUR"
+          bash ./build_recovery.sh "${{ matrix.flavour }}"
           ls -l "$W/images"
 
       - name: Upload artifacts
